@@ -371,23 +371,16 @@ class Recording {
     u64 _stop_nanos;
     int _tid;
     int _available_processors;
+    int _recorded_lib_count;
     Buffer _cpu_monitor_buf;
     Timer* _cpu_monitor;
     CpuTimes _last_times;
 
-    void startCpuMonitor(bool enabled) {
+    Timer* createCpuMonitor() {
         _last_times.proc.real = OS::getProcessCpuTime(&_last_times.proc.user, &_last_times.proc.system);
         _last_times.total.real = OS::getTotalCpuTime(&_last_times.total.user, &_last_times.total.system);
 
-        _cpu_monitor = enabled ? OS::startTimer(1000000000, cpuMonitorCallback, this) : NULL;
-        _cpu_monitor_lock.unlock();
-    }
-
-    void stopCpuMonitor() {
-        _cpu_monitor_lock.lock();
-        if (_cpu_monitor != NULL) {
-            OS::stopTimer(_cpu_monitor);
-        }
+        return OS::startTimer(1000000000, cpuMonitorCallback, this);
     }
 
     void cpuMonitorCycle() {
@@ -449,13 +442,33 @@ class Recording {
         if (!args.hasOption(NO_SYSTEM_PROPS)) {
             writeSystemProperties(_buf);
         }
+        if (!args.hasOption(NO_NATIVE_LIBS)) {
+            _recorded_lib_count = 0;
+            writeNativeLibraries(_buf);
+        } else {
+            _recorded_lib_count = -1;
+        }
         flush(_buf);
 
-        startCpuMonitor(!args.hasOption(NO_CPU_LOAD));
+        _cpu_monitor = !args.hasOption(NO_CPU_LOAD) ? createCpuMonitor() : NULL;
+        _cpu_monitor_lock.unlock();
     }
 
     ~Recording() {
-        stopCpuMonitor();
+        off_t chunk_end = finishChunk(true);
+
+        if (_append_fd >= 0) {
+            OS::copyFile(_fd, _append_fd, 0, chunk_end);
+        }
+
+        close(_fd);
+    }
+
+    off_t finishChunk(bool last) {
+        _cpu_monitor_lock.lock();
+        if (last && _cpu_monitor != NULL) {
+            OS::stopTimer(_cpu_monitor);
+        }
         flush(&_cpu_monitor_buf);
 
         writeNativeLibraries(_buf);
@@ -487,11 +500,21 @@ class Recording {
         result = pwrite(_fd, _buf->data(), 40, _chunk_start + 8);
         (void)result;
 
-        if (_append_fd >= 0) {
-            OS::copyFile(_fd, _append_fd, 0, chunk_end);
-        }
+        _buf->reset();
+        return chunk_end;
+    }
 
-        close(_fd);
+    void switchChunk() {
+        _chunk_start = finishChunk(false);
+        _start_time = _stop_time;
+        _start_nanos = _stop_nanos;
+
+        writeHeader(_buf);
+        writeMetadata(_buf);
+        writeRecordingInfo(_buf);
+        flush(_buf);
+
+        _cpu_monitor_lock.unlock();
     }
 
     static void JNICALL appendRecording(JNIEnv* env, jclass cls, jstring file_name) {
@@ -787,11 +810,13 @@ class Recording {
     }
 
     void writeNativeLibraries(Buffer* buf) {
+        if (_recorded_lib_count < 0) return;
+
         Profiler* profiler = Profiler::instance();
         NativeCodeCache** native_libs = profiler->_native_libs;
         int native_lib_count = profiler->_native_lib_count;
 
-        for (int i = 0; i < native_lib_count; i++) {
+        for (int i = _recorded_lib_count; i < native_lib_count; i++) {
             flushIfNeeded(buf, RECORDING_BUFFER_LIMIT - MAX_STRING_LENGTH);
             int start = buf->skip(5);
             buf->put8(T_NATIVE_LIBRARY);
@@ -800,8 +825,9 @@ class Recording {
             buf->putVar64((uintptr_t) native_libs[i]->minAddress());
             buf->putVar64((uintptr_t) native_libs[i]->maxAddress());
             buf->putVar32(start, buf->offset() - start);
-            
         }
+
+        _recorded_lib_count = native_lib_count;
     }
 
     void writeCpool(Buffer* buf) {
@@ -1092,6 +1118,14 @@ void FlightRecorder::stop() {
         _rec_lock.lock();
         delete _rec;
         _rec = NULL;
+    }
+}
+
+void FlightRecorder::flush() {
+    if (_rec != NULL) {
+        _rec_lock.lock();
+        _rec->switchChunk();
+        _rec_lock.unlock();
     }
 }
 

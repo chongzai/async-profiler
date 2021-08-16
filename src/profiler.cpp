@@ -925,7 +925,7 @@ Error Profiler::checkJvmCapabilities() {
 
 Error Profiler::start(Arguments& args, bool reset) {
     MutexLocker ml(_state_lock);
-    if (_state != IDLE) {
+    if (_state > IDLE) {
         return Error("Profiler already started");
     }
 
@@ -1043,9 +1043,11 @@ error2:
 error1:
     uninstallTraps();
     switchNativeMethodTraps(false);
-    for (int i = 0; i < CONCURRENCY_LEVEL; i++) _locks[i].lock();
+
+    lockAll();
     _jfr.stop();
-    for (int i = 0; i < CONCURRENCY_LEVEL; i++) _locks[i].unlock();
+    unlockAll();
+
     return error;
 }
 
@@ -1068,9 +1070,9 @@ Error Profiler::stop() {
     updateNativeThreadNames();
 
     // Acquire all spinlocks to avoid race with remaining signals
-    for (int i = 0; i < CONCURRENCY_LEVEL; i++) _locks[i].lock();
+    lockAll();
     _jfr.stop();
-    for (int i = 0; i < CONCURRENCY_LEVEL; i++) _locks[i].unlock();
+    unlockAll();
 
     _state = IDLE;
     return Error::OK;
@@ -1078,7 +1080,7 @@ Error Profiler::stop() {
 
 Error Profiler::check(Arguments& args) {
     MutexLocker ml(_state_lock);
-    if (_state != IDLE) {
+    if (_state > IDLE) {
         return Error("Profiler already started");
     }
 
@@ -1098,16 +1100,17 @@ Error Profiler::check(Arguments& args) {
     return error;
 }
 
-void Profiler::switchThreadEvents(jvmtiEventMode mode) {
-    if (_thread_events_state != mode) {
-        jvmtiEnv* jvmti = VM::jvmti();
-        jvmti->SetEventNotificationMode(mode, JVMTI_EVENT_THREAD_START, NULL);
-        jvmti->SetEventNotificationMode(mode, JVMTI_EVENT_THREAD_END, NULL);
-        _thread_events_state = mode;
+Error Profiler::dump(std::ostream& out, Arguments& args) {
+    MutexLocker ml(_state_lock);
+    if (_state != IDLE && _state != RUNNING) {
+        return Error("Profiler has not started");
     }
-}
 
-void Profiler::dump(std::ostream& out, Arguments& args) {
+    if (_state == RUNNING) {
+        updateJavaThreadNames();
+        updateNativeThreadNames();
+    }
+
     switch (args._output) {
         case OUTPUT_COLLAPSED:
             dumpCollapsed(out, args);
@@ -1121,8 +1124,34 @@ void Profiler::dump(std::ostream& out, Arguments& args) {
         case OUTPUT_TEXT:
             dumpText(out, args);
             break;
-        default:
+        case OUTPUT_JFR:
+            if (_state == RUNNING) {
+                lockAll();
+                _jfr.flush();
+                unlockAll();
+            }
             break;
+        default:
+            return Error("No output format selected");
+    }
+
+    return Error::OK;
+}
+
+void Profiler::lockAll() {
+    for (int i = 0; i < CONCURRENCY_LEVEL; i++) _locks[i].lock();
+}
+
+void Profiler::unlockAll() {
+    for (int i = 0; i < CONCURRENCY_LEVEL; i++) _locks[i].unlock();
+}
+
+void Profiler::switchThreadEvents(jvmtiEventMode mode) {
+    if (_thread_events_state != mode) {
+        jvmtiEnv* jvmti = VM::jvmti();
+        jvmti->SetEventNotificationMode(mode, JVMTI_EVENT_THREAD_START, NULL);
+        jvmti->SetEventNotificationMode(mode, JVMTI_EVENT_THREAD_END, NULL);
+        _thread_events_state = mode;
     }
 }
 
@@ -1132,13 +1161,12 @@ void Profiler::dump(std::ostream& out, Arguments& args) {
  * <frame>;<frame>;...;<topmost frame> <count>
  */
 void Profiler::dumpCollapsed(std::ostream& out, Arguments& args) {
-    MutexLocker ml(_state_lock);
-    if (_state != IDLE || _engine == NULL) return;
-
     FrameName fn(args, args._style, _thread_names_lock, _thread_names);
 
     std::vector<CallTraceSample*> samples;
+    lockAll();
     _call_trace_storage.collectSamples(samples);
+    unlockAll();
 
     for (std::vector<CallTraceSample*>::const_iterator it = samples.begin(); it != samples.end(); ++it) {
         CallTrace* trace = (*it)->trace;
@@ -1153,9 +1181,6 @@ void Profiler::dumpCollapsed(std::ostream& out, Arguments& args) {
 }
 
 void Profiler::dumpFlameGraph(std::ostream& out, Arguments& args, bool tree) {
-    MutexLocker ml(_state_lock);
-    if (_state != IDLE || _engine == NULL) return;
-
     char title[64];
     if (args._title == NULL) {
         Engine* active_engine = activeEngine();
@@ -1170,7 +1195,9 @@ void Profiler::dumpFlameGraph(std::ostream& out, Arguments& args, bool tree) {
     FrameName fn(args, args._style, _thread_names_lock, _thread_names);
 
     std::vector<CallTraceSample*> samples;
+    lockAll();
     _call_trace_storage.collectSamples(samples);
+    unlockAll();
 
     for (std::vector<CallTraceSample*>::const_iterator it = samples.begin(); it != samples.end(); ++it) {
         CallTrace* trace = (*it)->trace;
@@ -1208,9 +1235,6 @@ void Profiler::dumpFlameGraph(std::ostream& out, Arguments& args, bool tree) {
 }
 
 void Profiler::dumpText(std::ostream& out, Arguments& args) {
-    MutexLocker ml(_state_lock);
-    if (_state != IDLE || _engine == NULL) return;
-
     FrameName fn(args, args._style | STYLE_DOTTED, _thread_names_lock, _thread_names);
     char buf[1024] = {0};
 
@@ -1218,7 +1242,10 @@ void Profiler::dumpText(std::ostream& out, Arguments& args) {
     u64 total_counter = 0;
     {
         std::map<u64, CallTraceSample> map;
+        lockAll();
         _call_trace_storage.collectSamples(map);
+        unlockAll();
+
         samples.reserve(map.size());
 
         for (std::map<u64, CallTraceSample>::const_iterator it = map.begin(); it != map.end(); ++it) {
@@ -1307,10 +1334,20 @@ Error Profiler::runInternal(Arguments& args, std::ostream& out) {
         }
         case ACTION_STOP: {
             Error error = stop();
+            if (args._output == OUTPUT_NONE) {
+                if (error) {
+                    return error;
+                }
+                out << "Profiling stopped after " << uptime() << " seconds. No dump options specified" << std::endl;
+                break;
+            }
+            // Fall through
+        }
+        case ACTION_DUMP: {
+            Error error = dump(out, args);
             if (error) {
                 return error;
             }
-            out << "Profiling stopped after " << uptime() << " seconds. No dump options specified" << std::endl;
             break;
         }
         case ACTION_CHECK: {
@@ -1359,10 +1396,6 @@ Error Profiler::runInternal(Arguments& args, std::ostream& out) {
         case ACTION_FULL_VERSION:
             out << FULL_VERSION_STRING;
             break;
-        case ACTION_DUMP:
-            stop();
-            dump(out, args);
-            break;
         default:
             break;
     }
@@ -1388,8 +1421,8 @@ void Profiler::shutdown(Arguments& args) {
 
     // The last chance to dump profile before VM terminates
     if (_state == RUNNING) {
-        args._action = ACTION_DUMP;
-        Error error = args._output == OUTPUT_NONE ? stop() : run(args);
+        args._action = ACTION_STOP;
+        Error error = run(args);
         if (error) {
             Log::error(error.message());
         }
