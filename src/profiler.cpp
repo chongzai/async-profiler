@@ -1164,11 +1164,12 @@ void Profiler::dumpCollapsed(std::ostream& out, Arguments& args) {
     FrameName fn(args, args._style, _thread_names_lock, _thread_names);
 
     std::vector<CallTraceSample*> samples;
-    lockAll();
     _call_trace_storage.collectSamples(samples);
-    unlockAll();
 
     for (std::vector<CallTraceSample*>::const_iterator it = samples.begin(); it != samples.end(); ++it) {
+        u64 samples = args._counter == COUNTER_SAMPLES ? loadAcquire((*it)->samples) : loadAcquire((*it)->counter);
+        if (samples == 0) continue;
+
         CallTrace* trace = (*it)->trace;
         if (excludeTrace(&fn, trace)) continue;
 
@@ -1176,7 +1177,7 @@ void Profiler::dumpCollapsed(std::ostream& out, Arguments& args) {
             const char* frame_name = fn.name(trace->frames[j]);
             out << frame_name << (j == 0 ? ' ' : ';');
         }
-        out << (args._counter == COUNTER_SAMPLES ? (*it)->samples : (*it)->counter) << "\n";
+        out << samples << "\n";
     }
 }
 
@@ -1195,15 +1196,15 @@ void Profiler::dumpFlameGraph(std::ostream& out, Arguments& args, bool tree) {
     FrameName fn(args, args._style, _thread_names_lock, _thread_names);
 
     std::vector<CallTraceSample*> samples;
-    lockAll();
     _call_trace_storage.collectSamples(samples);
-    unlockAll();
 
     for (std::vector<CallTraceSample*>::const_iterator it = samples.begin(); it != samples.end(); ++it) {
+        u64 samples = args._counter == COUNTER_SAMPLES ? loadAcquire((*it)->samples) : loadAcquire((*it)->counter);
+        if (samples == 0) continue;
+
         CallTrace* trace = (*it)->trace;
         if (excludeTrace(&fn, trace)) continue;
 
-        u64 samples = (args._counter == COUNTER_SAMPLES ? (*it)->samples : (*it)->counter);
         int num_frames = trace->num_frames;
 
         Trie* f = flamegraph.root();
@@ -1242,10 +1243,7 @@ void Profiler::dumpText(std::ostream& out, Arguments& args) {
     u64 total_counter = 0;
     {
         std::map<u64, CallTraceSample> map;
-        lockAll();
         _call_trace_storage.collectSamples(map);
-        unlockAll();
-
         samples.reserve(map.size());
 
         for (std::map<u64, CallTraceSample>::const_iterator it = map.begin(); it != map.end(); ++it) {

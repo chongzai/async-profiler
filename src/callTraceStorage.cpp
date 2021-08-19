@@ -115,9 +115,8 @@ void CallTraceStorage::collectTraces(std::map<u32, CallTrace*>& map) {
         u32 capacity = table->capacity();
 
         for (u32 slot = 0; slot < capacity; slot++) {
-            if (keys[slot] != 0 && values[slot].samples != 0) {
+            if (keys[slot] != 0 && loadAcquire(values[slot].samples) != 0) {
                 // Reset samples to avoid duplication of call traces between JFR chunks
-                // TODO: use a separate marker instead?
                 values[slot].samples = 0;
                 map[capacity - (INITIAL_CAPACITY - 1) + slot] = values[slot].trace;
             }
@@ -150,7 +149,7 @@ void CallTraceStorage::collectSamples(std::map<u64, CallTraceSample>& map) {
         u32 capacity = table->capacity();
 
         for (u32 slot = 0; slot < capacity; slot++) {
-            if (keys[slot] != 0) {
+            if (keys[slot] != 0 && loadAcquire(values[slot].counter) != 0) {
                 map[keys[slot]] += values[slot];
             }
         }
