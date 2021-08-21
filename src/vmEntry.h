@@ -117,6 +117,12 @@ class VM {
         return _vm->GetEnv((void**)&jni, JNI_VERSION_1_6) == 0 ? jni : NULL;
     }
 
+    static JNIEnv* attachDaemonThread(const char* name) {
+        JNIEnv* jni;
+        JavaVMAttachArgs args = {JNI_VERSION_1_6, (char*)name, NULL};
+        return _vm->AttachCurrentThreadAsDaemon((void**)&jni, &args) == 0 ? jni : NULL;
+    }
+
     static VMManagement* management() {
         return _getManagement != NULL ? _getManagement(0x20030000) : NULL;
     }

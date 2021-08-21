@@ -20,6 +20,7 @@
 #include <cxxabi.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include "dictionary.h"
 #include "os.h"
 #include "profiler.h"
+#include "spinlock.h"
 #include "symbols.h"
 #include "threadFilter.h"
 #include "vmStructs.h"
@@ -47,6 +49,8 @@ const int RECORDING_BUFFER_SIZE = 65536;
 const int RECORDING_BUFFER_LIMIT = RECORDING_BUFFER_SIZE - 4096;
 const int MAX_STRING_LENGTH = 8191;
 
+
+static SpinLock _rec_lock(1);
 
 static const char* const SETTING_RING[] = {NULL, "kernel", "user"};
 static const char* const SETTING_CSTACK[] = {NULL, "no", "fp", "lbr"};
@@ -353,7 +357,6 @@ class RecordingBuffer : public Buffer {
 
 class Recording {
   private:
-    static SpinLock _cpu_monitor_lock;
     static int _append_fd;
 
     static char* _agent_properties;
@@ -362,28 +365,31 @@ class Recording {
     static char* _java_command;
 
     RecordingBuffer _buf[CONCURRENCY_LEVEL];
+    Timer* _timer;
     int _fd;
     off_t _chunk_start;
     ThreadFilter _thread_set;
+
     u64 _start_time;
     u64 _start_nanos;
     u64 _stop_time;
     u64 _stop_nanos;
+
+    u64 _bytes_written;
+    u64 _chunk_size;
+    u64 _chunk_time;
+
     int _tid;
     int _available_processors;
     int _recorded_lib_count;
+
+    bool _cpu_monitor_enabled;
     Buffer _cpu_monitor_buf;
-    Timer* _cpu_monitor;
     CpuTimes _last_times;
 
-    Timer* createCpuMonitor() {
-        _last_times.proc.real = OS::getProcessCpuTime(&_last_times.proc.user, &_last_times.proc.system);
-        _last_times.total.real = OS::getTotalCpuTime(&_last_times.total.user, &_last_times.total.system);
-
-        return OS::startTimer(1000000000, cpuMonitorCallback, this);
-    }
-
     void cpuMonitorCycle() {
+        if (!_cpu_monitor_enabled) return;
+
         CpuTimes times;
         times.proc.real = OS::getProcessCpuTime(&times.proc.user, &times.proc.system);
         times.total.real = OS::getTotalCpuTime(&times.total.user, &times.total.system);
@@ -411,10 +417,26 @@ class Recording {
         _last_times = times;
     }
 
-    static void cpuMonitorCallback(void* arg) {
-        if (_cpu_monitor_lock.tryLock()) {
-            ((Recording*)arg)->cpuMonitorCycle();
-            _cpu_monitor_lock.unlock();
+    bool needSwitchChunk() {
+        return loadAcquire(_bytes_written) >= _chunk_size || OS::millis() - _start_time >= _chunk_time;
+    }
+
+    static void timerCallback(void* arg) {
+        bool need_switch_chunk = false;
+
+        if (_rec_lock.tryLockShared()) {
+            Recording* rec = (Recording*)arg;
+            rec->cpuMonitorCycle();
+            need_switch_chunk = rec->needSwitchChunk();
+            _rec_lock.unlockShared();
+        }
+
+        if (need_switch_chunk) {
+            // FIXME: Create a separate Java thread 
+            // Need to attach the timer thread to the JVM in order to call JNI/JVM TI functions.
+            VM::attachDaemonThread("Async-profiler timer callback");
+            // Switch JFR chunk under the profiling state lock.
+            Profiler::instance()->flushJfr();
         }
     }
 
@@ -427,6 +449,11 @@ class Recording {
         _chunk_start = lseek(_fd, 0, SEEK_END);
         _start_time = OS::millis();
         _start_nanos = OS::nanotime();
+        _bytes_written = 0;
+
+        _chunk_size = args._chunk_size <= 0 ? LONG_MAX : (args._chunk_size < 250000 ? 250000 : args._chunk_size);
+        _chunk_time = args._chunk_time <= 0 ? LONG_MAX : (args._chunk_time < 10 ? 10 : args._chunk_time) * 1000;
+
         _tid = OS::threadId();
         addThread(_tid);
         VM::jvmti()->GetAvailableProcessors(&_available_processors);
@@ -450,12 +477,21 @@ class Recording {
         }
         flush(_buf);
 
-        _cpu_monitor = !args.hasOption(NO_CPU_LOAD) ? createCpuMonitor() : NULL;
-        _cpu_monitor_lock.unlock();
+        _cpu_monitor_enabled = !args.hasOption(NO_CPU_LOAD);
+        if (_cpu_monitor_enabled) {
+            _last_times.proc.real = OS::getProcessCpuTime(&_last_times.proc.user, &_last_times.proc.system);
+            _last_times.total.real = OS::getTotalCpuTime(&_last_times.total.user, &_last_times.total.system);
+        }
+
+        _timer = OS::startTimer(1000000000, timerCallback, this);
     }
 
     ~Recording() {
-        off_t chunk_end = finishChunk(true);
+        if (_timer != NULL) {
+            OS::stopTimer(_timer);
+        }
+
+        off_t chunk_end = finishChunk();
 
         if (_append_fd >= 0) {
             OS::copyFile(_fd, _append_fd, 0, chunk_end);
@@ -464,11 +500,7 @@ class Recording {
         close(_fd);
     }
 
-    off_t finishChunk(bool last) {
-        _cpu_monitor_lock.lock();
-        if (last && _cpu_monitor != NULL) {
-            OS::stopTimer(_cpu_monitor);
-        }
+    off_t finishChunk() {
         flush(&_cpu_monitor_buf);
 
         writeNativeLibraries(_buf);
@@ -505,16 +537,15 @@ class Recording {
     }
 
     void switchChunk() {
-        _chunk_start = finishChunk(false);
+        _chunk_start = finishChunk();
         _start_time = _stop_time;
         _start_nanos = _stop_nanos;
+        _bytes_written = 0;
 
         writeHeader(_buf);
         writeMetadata(_buf);
         writeRecordingInfo(_buf);
         flush(_buf);
-
-        _cpu_monitor_lock.unlock();
     }
 
     static void JNICALL appendRecording(JNIEnv* env, jclass cls, jstring file_name) {
@@ -588,7 +619,9 @@ class Recording {
 
     void flush(Buffer* buf) {
         ssize_t result = write(_fd, buf->data(), buf->offset());
-        (void)result;
+        if (result > 0) {
+            atomicInc(_bytes_written, result);
+        }
         buf->reset();
     }
 
@@ -674,6 +707,8 @@ class Recording {
         writeIntSetting(buf, T_ACTIVE_RECORDING, "jstackdepth", args._jstackdepth);
         writeIntSetting(buf, T_ACTIVE_RECORDING, "safemode", args._safe_mode);
         writeIntSetting(buf, T_ACTIVE_RECORDING, "jfropts", args._jfr_options);
+        writeIntSetting(buf, T_ACTIVE_RECORDING, "chunksize", args._chunk_size);
+        writeIntSetting(buf, T_ACTIVE_RECORDING, "chunktime", args._chunk_time);
 
         writeBoolSetting(buf, T_EXECUTION_SAMPLE, "enabled", args._event != NULL);
         if (args._event != NULL) {
@@ -1081,7 +1116,6 @@ class Recording {
     }
 };
 
-SpinLock Recording::_cpu_monitor_lock(1);
 int Recording::_append_fd = -1;
 
 char* Recording::_agent_properties = NULL;
