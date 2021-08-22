@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,7 @@
 #include "dictionary.h"
 #include "os.h"
 #include "profiler.h"
-#include "spinlock.h"
+#include "spinLock.h"
 #include "symbols.h"
 #include "threadFilter.h"
 #include "vmStructs.h"
@@ -365,8 +366,9 @@ class Recording {
     static char* _java_command;
 
     RecordingBuffer _buf[CONCURRENCY_LEVEL];
-    Timer* _timer;
     int _fd;
+    volatile bool _timer_is_running;
+    pthread_t _timer_thread;
     off_t _chunk_start;
     ThreadFilter _thread_set;
 
@@ -421,22 +423,51 @@ class Recording {
         return loadAcquire(_bytes_written) >= _chunk_size || OS::millis() - _start_time >= _chunk_time;
     }
 
-    static void timerCallback(void* arg) {
-        bool need_switch_chunk = false;
+    void timerLoop() {
+        u64 current_time = OS::nanotime();
 
-        if (_rec_lock.tryLockShared()) {
-            Recording* rec = (Recording*)arg;
-            rec->cpuMonitorCycle();
-            need_switch_chunk = rec->needSwitchChunk();
-            _rec_lock.unlockShared();
+        while (_timer_is_running) {
+            u64 sleep_until = current_time + 1000000000;
+            while ((current_time = OS::nanotime()) < sleep_until) {
+                OS::sleep(sleep_until - current_time);
+                if (!_timer_is_running) return;
+            }
+
+            bool need_switch_chunk = false;
+
+            if (_rec_lock.tryLockShared()) {
+                cpuMonitorCycle();
+                need_switch_chunk = needSwitchChunk();
+                _rec_lock.unlockShared();
+            }
+
+            if (need_switch_chunk) {
+                // Switch JFR chunk under the profiling state lock
+                Profiler::instance()->flushJfr();
+            }
         }
+    }
 
-        if (need_switch_chunk) {
-            // FIXME: Create a separate Java thread 
-            // Need to attach the timer thread to the JVM in order to call JNI/JVM TI functions.
-            VM::attachDaemonThread("Async-profiler timer callback");
-            // Switch JFR chunk under the profiling state lock.
-            Profiler::instance()->flushJfr();
+    static void* threadEntry(void* rec) {
+        VM::attachThread("Async-profiler Timer");
+        ((Recording*)rec)->timerLoop();
+        VM::detachThread();
+        return NULL;
+    }
+
+    void startTimer() {
+        _timer_is_running = true;
+        if (pthread_create(&_timer_thread, NULL, threadEntry, this) != 0) {
+            Log::warn("Unable to create JFR timer thread");
+            _timer_is_running = false;
+        }
+    }
+
+    void stopTimer() {
+        if (_timer_is_running) {
+            _timer_is_running = false;
+            pthread_kill(_timer_thread, WAKEUP_SIGNAL);
+            pthread_join(_timer_thread, NULL);
         }
     }
 
@@ -451,7 +482,7 @@ class Recording {
         _start_nanos = OS::nanotime();
         _bytes_written = 0;
 
-        _chunk_size = args._chunk_size <= 0 ? LONG_MAX : (args._chunk_size < 250000 ? 250000 : args._chunk_size);
+        _chunk_size = args._chunk_size <= 0 ? LONG_MAX : (args._chunk_size < 262144 ? 262144 : args._chunk_size);
         _chunk_time = args._chunk_time <= 0 ? LONG_MAX : (args._chunk_time < 10 ? 10 : args._chunk_time) * 1000;
 
         _tid = OS::threadId();
@@ -483,13 +514,11 @@ class Recording {
             _last_times.total.real = OS::getTotalCpuTime(&_last_times.total.user, &_last_times.total.system);
         }
 
-        _timer = OS::startTimer(1000000000, timerCallback, this);
+        startTimer();
     }
 
     ~Recording() {
-        if (_timer != NULL) {
-            OS::stopTimer(_timer);
-        }
+        stopTimer();
 
         off_t chunk_end = finishChunk();
 
