@@ -71,24 +71,16 @@ public class JfrReader implements Closeable {
         this.ch = FileChannel.open(Paths.get(fileName), StandardOpenOption.READ);
         this.buf = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size());
 
-        if (buf.getInt(0) != 0x464c5200) {
-            throw new IOException("Not a valid JFR file");
+        long endNanos = 0;
+        for (int chunkStart = 0; chunkStart < buf.capacity(); ) {
+            endNanos = Math.max(endNanos, buf.getLong(chunkStart + 32) + buf.getLong(chunkStart + 40));
+            chunkStart += readChunk(chunkStart);
         }
-
-        int version = buf.getInt(4);
-        if (version < 0x20000 || version > 0x2ffff) {
-            throw new IOException("Unsupported JFR version: " + (version >>> 16) + "." + (version & 0xffff));
-        }
-
-        buf.limit((int) buf.getLong(8));
 
         this.startNanos = buf.getLong(32);
-        this.durationNanos = buf.getLong(40);
+        this.durationNanos = endNanos - startNanos;
         this.startTicks = buf.getLong(48);
         this.ticksPerSec = buf.getLong(56);
-
-        readMeta();
-        readConstantPool();
 
         this.executionSample = getTypeId("jdk.ExecutionSample");
         this.nativeMethodSample = getTypeId("jdk.NativeMethodSample");
@@ -97,7 +89,7 @@ public class JfrReader implements Closeable {
         this.monitorEnter = getTypeId("jdk.JavaMonitorEnter");
         this.threadPark = getTypeId("jdk.ThreadPark");
 
-        buf.position(CHUNK_HEADER_SIZE);
+        moveToNextChunk(0);
     }
 
     @Override
@@ -124,7 +116,7 @@ public class JfrReader implements Closeable {
 
     @SuppressWarnings("unchecked")
     public <E extends Event> E readEvent(Class<E> cls) {
-        while (buf.hasRemaining()) {
+        while (buf.hasRemaining() || moveToNextChunk(buf.position())) {
             int position = buf.position();
             int size = getVarint();
             int type = getVarint();
@@ -175,8 +167,37 @@ public class JfrReader implements Closeable {
         return new ContendedLock(time, tid, stackTraceId, duration, classId);
     }
 
+    private boolean moveToNextChunk(int pos) {
+        int newPos = pos + CHUNK_HEADER_SIZE;
+        if (newPos < buf.capacity()) {
+            buf.limit(newPos);
+            buf.position(newPos);
+            buf.limit(pos + (int) buf.getLong(pos + 8));
+            return true;
+        }
+        return false;
+    }
+
+    private int readChunk(int chunkStart) throws IOException {
+        if (buf.getInt(chunkStart) != 0x464c5200) {
+            throw new IOException("Not a valid JFR file");
+        }
+
+        int version = buf.getInt(chunkStart + 4);
+        if (version < 0x20000 || version > 0x2ffff) {
+            throw new IOException("Unsupported JFR version: " + (version >>> 16) + "." + (version & 0xffff));
+        }
+
+        buf.position(chunkStart + buf.getInt(chunkStart + (META_OFFSET + 4)));
+        readMeta();
+
+        buf.position(chunkStart + buf.getInt(chunkStart + (CPOOL_OFFSET + 4)));
+        readConstantPool();
+
+        return (int) buf.getLong(chunkStart + 8);
+    }
+
     private void readMeta() {
-        buf.position(buf.getInt(META_OFFSET + 4));
         getVarint();
         getVarint();
         getVarlong();
@@ -225,9 +246,7 @@ public class JfrReader implements Closeable {
     }
 
     private void readConstantPool() {
-        int offset = buf.getInt(CPOOL_OFFSET + 4);
-        while (true) {
-            buf.position(offset);
+        for (int position = buf.position(); ; buf.position(position)) {
             getVarint();
             getVarint();
             getVarlong();
@@ -244,7 +263,7 @@ public class JfrReader implements Closeable {
             if (delta == 0) {
                 break;
             }
-            offset += delta;
+            position += delta;
         }
     }
 

@@ -377,6 +377,7 @@ class Recording {
     u64 _stop_time;
     u64 _stop_nanos;
 
+    u64 _base_id;
     u64 _bytes_written;
     u64 _chunk_size;
     u64 _chunk_time;
@@ -480,6 +481,7 @@ class Recording {
         _chunk_start = lseek(_fd, 0, SEEK_END);
         _start_time = OS::millis();
         _start_nanos = OS::nanotime();
+        _base_id = 0;
         _bytes_written = 0;
 
         _chunk_size = args._chunk_size <= 0 ? LONG_MAX : (args._chunk_size < 262144 ? 262144 : args._chunk_size);
@@ -569,6 +571,7 @@ class Recording {
         _chunk_start = finishChunk();
         _start_time = _stop_time;
         _start_nanos = _stop_nanos;
+        _base_id += 0x1000000;
         _bytes_written = 0;
 
         writeHeader(_buf);
@@ -985,7 +988,7 @@ class Recording {
             buf->putVar32(trace->num_frames);
             for (int i = 0; i < trace->num_frames; i++) {
                 MethodInfo* mi = lookup->resolveMethod(trace->frames[i]);
-                buf->putVar32(mi->_key);
+                buf->putVar64(mi->_key | _base_id);
                 jint bci = trace->frames[i].bci;
                 if (bci >= 0) {
                     buf->putVar32(mi->getLineNumber(bci));
@@ -1008,10 +1011,10 @@ class Recording {
         buf->putVar32(method_map.size());
         for (std::map<jmethodID, MethodInfo>::const_iterator it = method_map.begin(); it != method_map.end(); ++it) {
             const MethodInfo& mi = it->second;
-            buf->putVar32(mi._key);
+            buf->putVar64(mi._key | _base_id);
             buf->putVar32(mi._class);
-            buf->putVar32(mi._name);
-            buf->putVar32(mi._sig);
+            buf->putVar64(mi._name | _base_id);
+            buf->putVar64(mi._sig | _base_id);
             buf->putVar32(mi._modifiers);
             buf->putVar32(0);  // hidden
             flushIfNeeded(buf);
@@ -1028,8 +1031,8 @@ class Recording {
             const char* name = it->second;
             buf->putVar32(it->first);
             buf->putVar32(0);  // classLoader
-            buf->putVar32(lookup->getSymbol(name));
-            buf->putVar32(lookup->getPackage(name));
+            buf->putVar64(lookup->getSymbol(name) | _base_id);
+            buf->putVar64(lookup->getPackage(name) | _base_id);
             buf->putVar32(0);  // access flags
             flushIfNeeded(buf);
         }
@@ -1042,8 +1045,8 @@ class Recording {
         buf->putVar32(T_PACKAGE);
         buf->putVar32(packages.size());
         for (std::map<u32, const char*>::const_iterator it = packages.begin(); it != packages.end(); ++it) {
-            buf->putVar32(it->first);
-            buf->putVar32(lookup->getSymbol(it->second));
+            buf->putVar64(it->first | _base_id);
+            buf->putVar64(lookup->getSymbol(it->second) | _base_id);
             flushIfNeeded(buf);
         }
     }
@@ -1055,7 +1058,7 @@ class Recording {
         buf->putVar32(T_SYMBOL);
         buf->putVar32(symbols.size());
         for (std::map<u32, const char*>::const_iterator it = symbols.begin(); it != symbols.end(); ++it) {
-            buf->putVar32(it->first);
+            buf->putVar64(it->first | _base_id);
             buf->putUtf8(it->second);
             flushIfNeeded(buf);
         }

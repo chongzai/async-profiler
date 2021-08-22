@@ -141,17 +141,21 @@ public class jfr2flame {
         }
 
         MethodRef method = jfr.methods.get(methodId);
-        ClassRef cls = jfr.classes.get(method.cls);
-        byte[] className = jfr.symbols.get(cls.name);
-        byte[] methodName = jfr.symbols.get(method.name);
-
-        if (className == null || className.length == 0) {
-            String methodStr = new String(methodName, StandardCharsets.UTF_8);
-            result = type == FRAME_KERNEL ? methodStr + "_[k]" : methodStr;
+        if (method == null) {
+            result = "unknown";
         } else {
-            String classStr = new String(className, StandardCharsets.UTF_8);
-            String methodStr = new String(methodName, StandardCharsets.UTF_8);
-            result = classStr + '.' + methodStr + "_[j]";
+            ClassRef cls = jfr.classes.get(method.cls);
+            byte[] className = jfr.symbols.get(cls.name);
+            byte[] methodName = jfr.symbols.get(method.name);
+
+            if (className == null || className.length == 0) {
+                String methodStr = new String(methodName, StandardCharsets.UTF_8);
+                result = type == FRAME_KERNEL ? methodStr + "_[k]" : methodStr;
+            } else {
+                String classStr = new String(className, StandardCharsets.UTF_8);
+                String methodStr = new String(methodName, StandardCharsets.UTF_8);
+                result = classStr + '.' + methodStr + "_[j]";
+            }
         }
 
         methodNames.put(methodId, result);
