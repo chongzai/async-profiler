@@ -38,12 +38,13 @@ import java.util.Map;
  * Parses JFR output produced by async-profiler.
  */
 public class JfrReader implements Closeable {
+    private static final int BUFFER_SIZE = 2 * 1024 * 1024;
     private static final int CHUNK_HEADER_SIZE = 68;
-    private static final int CPOOL_OFFSET = 16;
-    private static final int META_OFFSET = 24;
+    private static final int CHUNK_SIGNATURE = 0x464c5200;
 
     private final FileChannel ch;
-    private final ByteBuffer buf;
+    private ByteBuffer buf;
+    private long filePosition;
 
     public final long startNanos;
     public final long durationNanos;
@@ -67,20 +68,23 @@ public class JfrReader implements Closeable {
     private final int monitorEnter;
     private final int threadPark;
 
+    private final boolean hasPreviousOwner;
+    private final boolean hasParkUntil;
+
     public JfrReader(String fileName) throws IOException {
         this.ch = FileChannel.open(Paths.get(fileName), StandardOpenOption.READ);
-        this.buf = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size());
+        this.buf = ByteBuffer.allocateDirect(BUFFER_SIZE);
 
-        long endNanos = 0;
-        for (int chunkStart = 0; chunkStart < buf.capacity(); ) {
-            endNanos = Math.max(endNanos, buf.getLong(chunkStart + 32) + buf.getLong(chunkStart + 40));
-            chunkStart += readChunk(chunkStart);
+        long[] times = {Long.MAX_VALUE, Long.MIN_VALUE, Long.MAX_VALUE, 0};
+
+        for (long chunkStart = 0, fileSize = ch.size(); chunkStart < fileSize; ) {
+            chunkStart += readChunk(chunkStart, times);
         }
 
-        this.startNanos = buf.getLong(32);
-        this.durationNanos = endNanos - startNanos;
-        this.startTicks = buf.getLong(48);
-        this.ticksPerSec = buf.getLong(56);
+        this.startNanos = times[0];
+        this.durationNanos = times[1] - startNanos;
+        this.startTicks = times[2];
+        this.ticksPerSec = times[3];
 
         this.executionSample = getTypeId("jdk.ExecutionSample");
         this.nativeMethodSample = getTypeId("jdk.NativeMethodSample");
@@ -89,7 +93,10 @@ public class JfrReader implements Closeable {
         this.monitorEnter = getTypeId("jdk.JavaMonitorEnter");
         this.threadPark = getTypeId("jdk.ThreadPark");
 
-        moveToNextChunk(0);
+        this.hasPreviousOwner = hasField("jdk.JavaMonitorEnter", "previousOwner");
+        this.hasParkUntil = hasField("jdk.ThreadPark", "until");
+
+        seek(CHUNK_HEADER_SIZE);
     }
 
     @Override
@@ -97,11 +104,11 @@ public class JfrReader implements Closeable {
         ch.close();
     }
 
-    public List<Event> readAllEvents() {
+    public List<Event> readAllEvents() throws IOException {
         return readAllEvents(null);
     }
 
-    public <E extends Event> List<E> readAllEvents(Class<E> cls) {
+    public <E extends Event> List<E> readAllEvents(Class<E> cls) throws IOException {
         ArrayList<E> events = new ArrayList<>();
         for (E event; (event = readEvent(cls)) != null; ) {
             events.add(event);
@@ -110,16 +117,21 @@ public class JfrReader implements Closeable {
         return events;
     }
 
-    public Event readEvent() {
+    public Event readEvent() throws IOException {
         return readEvent(null);
     }
 
     @SuppressWarnings("unchecked")
-    public <E extends Event> E readEvent(Class<E> cls) {
-        while (buf.hasRemaining() || moveToNextChunk(buf.position())) {
-            int position = buf.position();
+    public <E extends Event> E readEvent(Class<E> cls) throws IOException {
+        while (ensureBytes(CHUNK_HEADER_SIZE)) {
+            int pos = buf.position();
             int size = getVarint();
             int type = getVarint();
+
+            if (type == 'L' && buf.getInt(pos) == CHUNK_SIGNATURE) {
+                buf.position(pos + CHUNK_HEADER_SIZE);
+                continue;
+            }
 
             if (type == executionSample || type == nativeMethodSample) {
                 if (cls == null || cls == ExecutionSample.class) return (E) readExecutionSample();
@@ -128,12 +140,16 @@ public class JfrReader implements Closeable {
             } else if (type == allocationOutsideTLAB) {
                 if (cls == null || cls == AllocationSample.class) return (E) readAllocationSample(false);
             } else if (type == monitorEnter) {
-                if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(false);
+                if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(false, hasPreviousOwner);
             } else if (type == threadPark) {
-                if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(true);
+                if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(true, hasParkUntil);
             }
 
-            buf.position(position + size);
+            if ((pos += size) <= buf.limit()) {
+                buf.position(pos);
+            } else {
+                seek(filePosition + pos);
+            }
         }
         return null;
     }
@@ -156,49 +172,51 @@ public class JfrReader implements Closeable {
         return new AllocationSample(time, tid, stackTraceId, classId, allocationSize, tlabSize);
     }
 
-    private ContendedLock readContendedLock(boolean hasTimeout) {
+    private ContendedLock readContendedLock(boolean hasTimeout, boolean hasExtraField) {
         long time = getVarlong();
         long duration = getVarlong();
         int tid = getVarint();
         int stackTraceId = getVarint();
         int classId = getVarint();
         if (hasTimeout) getVarlong();
+        if (hasExtraField) getVarlong();
         long address = getVarlong();
         return new ContendedLock(time, tid, stackTraceId, duration, classId);
     }
 
-    private boolean moveToNextChunk(int pos) {
-        int newPos = pos + CHUNK_HEADER_SIZE;
-        if (newPos < buf.capacity()) {
-            buf.limit(newPos);
-            buf.position(newPos);
-            buf.limit(pos + (int) buf.getLong(pos + 8));
-            return true;
-        }
-        return false;
-    }
+    private long readChunk(long chunkStart, long[] times) throws IOException {
+        seek(chunkStart);
+        ensureBytes(CHUNK_HEADER_SIZE);
 
-    private int readChunk(int chunkStart) throws IOException {
-        if (buf.getInt(chunkStart) != 0x464c5200) {
+        if (buf.getInt(0) != CHUNK_SIGNATURE) {
             throw new IOException("Not a valid JFR file");
         }
 
-        int version = buf.getInt(chunkStart + 4);
+        int version = buf.getInt(4);
         if (version < 0x20000 || version > 0x2ffff) {
             throw new IOException("Unsupported JFR version: " + (version >>> 16) + "." + (version & 0xffff));
         }
 
-        buf.position(chunkStart + buf.getInt(chunkStart + (META_OFFSET + 4)));
-        readMeta();
+        long chunkSize = buf.getLong(8);
+        long cpOffset = buf.getLong(16);
+        long metaOffset = buf.getLong(24);
 
-        buf.position(chunkStart + buf.getInt(chunkStart + (CPOOL_OFFSET + 4)));
-        readConstantPool();
+        times[0] = Math.min(times[0], buf.getLong(32));
+        times[1] = Math.max(times[1], buf.getLong(32) + buf.getLong(40));
+        times[2] = Math.min(times[2], buf.getLong(48));
+        times[3] = buf.getLong(56);
 
-        return (int) buf.getLong(chunkStart + 8);
+        readMeta(chunkStart + metaOffset);
+        readConstantPool(chunkStart + cpOffset);
+
+        return chunkSize;
     }
 
-    private void readMeta() {
-        getVarint();
+    private void readMeta(long metaOffset) throws IOException {
+        seek(metaOffset);
+        ensureBytes(5);
+
+        ensureBytes(getVarint() - buf.position());
         getVarint();
         getVarlong();
         getVarlong();
@@ -245,13 +263,17 @@ public class JfrReader implements Closeable {
         }
     }
 
-    private void readConstantPool() {
-        for (int position = buf.position(); ; buf.position(position)) {
-            getVarint();
+    private void readConstantPool(long cpOffset) throws IOException {
+        long delta;
+        do {
+            seek(cpOffset);
+            ensureBytes(5);
+
+            ensureBytes(getVarint() - buf.position());
             getVarint();
             getVarlong();
             getVarlong();
-            long delta = getVarlong();
+            delta = getVarlong();
             getVarint();
 
             int poolCount = getVarint();
@@ -259,12 +281,7 @@ public class JfrReader implements Closeable {
                 int type = getVarint();
                 readConstants(types.get(type));
             }
-
-            if (delta == 0) {
-                break;
-            }
-            position += delta;
-        }
+        } while (delta != 0 && (cpOffset += delta) > 0);
     }
 
     private void readConstants(JfrClass type) {
@@ -409,6 +426,11 @@ public class JfrReader implements Closeable {
         return type != null ? type.id : -1;
     }
 
+    private boolean hasField(String typeName, String fieldName) {
+        JfrClass type = typesByName.get(typeName);
+        return type != null && type.field(fieldName) != null;
+    }
+
     private int getVarint() {
         int result = 0;
         for (int shift = 0; ; shift += 7) {
@@ -458,5 +480,33 @@ public class JfrReader implements Closeable {
         byte[] bytes = new byte[getVarint()];
         buf.get(bytes);
         return bytes;
+    }
+
+    private void seek(long pos) throws IOException {
+        filePosition = pos;
+        ch.position(pos);
+        buf.rewind().flip();
+    }
+
+    private boolean ensureBytes(int needed) throws IOException {
+        if (buf.remaining() >= needed) {
+            return true;
+        }
+
+        filePosition += buf.position();
+
+        if (buf.capacity() < needed) {
+            ByteBuffer newBuf = ByteBuffer.allocateDirect(needed);
+            newBuf.put(buf);
+            buf = newBuf;
+        } else {
+            buf.compact();
+        }
+
+        while (ch.read(buf) > 0 && buf.position() < needed) {
+            // keep reading
+        }
+        buf.flip();
+        return buf.limit() > 0;
     }
 }

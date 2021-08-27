@@ -44,7 +44,7 @@ public class jfr2nflx {
     private final JfrReader jfr;
     private final List<ExecutionSample> samples;
 
-    public jfr2nflx(JfrReader jfr) {
+    public jfr2nflx(JfrReader jfr) throws IOException {
         this.jfr = jfr;
         this.samples = jfr.readAllEvents(ExecutionSample.class);
     }

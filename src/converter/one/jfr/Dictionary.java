@@ -101,6 +101,7 @@ public class Dictionary<T> {
     }
 
     private static int hashCode(long key) {
+        key *= 0xc6a4a7935bd1e995L;
         return (int) (key ^ (key >>> 32));
     }
 
