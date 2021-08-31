@@ -81,7 +81,7 @@ struct CpuTimes {
 
 class MethodInfo {
   public:
-    MethodInfo() : _key(0) {
+    MethodInfo() : _mark(false), _key(0) {
     }
 
     bool _mark;
@@ -163,7 +163,7 @@ class Lookup {
         }
     }
 
-    void fillJavaMethodInfo(MethodInfo* mi, jmethodID method) {
+    void fillJavaMethodInfo(MethodInfo* mi, jmethodID method, bool first_time) {
         jvmtiEnv* jvmti = VM::jvmti();
 
         jclass method_class;
@@ -187,11 +187,11 @@ class Lookup {
         jvmti->Deallocate((unsigned char*)method_name);
         jvmti->Deallocate((unsigned char*)class_name);
 
-        if (jvmti->GetMethodModifiers(method, &mi->_modifiers) != 0) {
+        if (first_time && jvmti->GetMethodModifiers(method, &mi->_modifiers) != 0) {
             mi->_modifiers = 0;
         }
 
-        if (jvmti->GetLineNumberTable(method, &mi->_line_number_table_size, &mi->_line_number_table) != 0) {
+        if (first_time && jvmti->GetLineNumberTable(method, &mi->_line_number_table_size, &mi->_line_number_table) != 0) {
             mi->_line_number_table_size = 0;
             mi->_line_number_table = NULL;
         }
@@ -207,17 +207,20 @@ class Lookup {
     MethodInfo* resolveMethod(ASGCT_CallFrame& frame) {
         jmethodID method = frame.method_id;
         MethodInfo* mi = &(*_method_map)[method];
-        mi->_mark = true;
 
-        if (mi->_key == 0) {
+        bool first_time = mi->_key == 0;
+        if (first_time) {
             mi->_key = _method_map->size();
+        }
 
+        if (!mi->_mark) {
+            mi->_mark = true;
             if (method == NULL) {
                 fillNativeMethodInfo(mi, "unknown");
             } else if (frame.bci == BCI_NATIVE_FRAME || frame.bci == BCI_ERROR) {
                 fillNativeMethodInfo(mi, (const char*)method);
             } else {
-                fillJavaMethodInfo(mi, method);
+                fillJavaMethodInfo(mi, method, first_time);
             }
         }
 
