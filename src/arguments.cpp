@@ -70,8 +70,8 @@ static const Multiplier UNIVERSAL[] = {{'n', 1}, {'u', 1000}, {'m', 1000000}, {'
 //     flat[=N]        - dump top N methods (aka flat profile)
 //     samples         - count the number of samples (default)
 //     total           - count the total value (time, bytes, etc.) instead of samples
-//     chunksize=N     - approximate size of JFR chunk in bytes (default: 0 = unlimited)
-//     chunktime=N     - duration of JFR chunk in seconds (default: 0 = unlimited)
+//     chunksize=N     - approximate size of JFR chunk in bytes (default: 100 MB)
+//     chunktime=N     - duration of JFR chunk in seconds (default: 1 hour)
 //     interval=N      - sampling interval in ns (default: 10'000'000, i.e. 10 ms)
 //     jstackdepth=N   - maximum Java stack depth (default: 2048)
 //     safemode=BITS   - disable stack recovery techniques (default: 0, i.e. everything enabled)

@@ -388,7 +388,7 @@ The following is a complete list of the command-line options accepted by
   e.g. total allocation size.
 
 * `--chunksize N`, `--chunktime N` - approximate size and time limits for a single JFR chunk.
-  Example: `./profiler.sh -f profile.jfr --chunksize 32m --chunktime 1h 8983`
+  Example: `./profiler.sh -f profile.jfr --chunksize 100m --chunktime 1h 8983`
 
 * `-I include`, `-X exclude` - filter stack traces by the given pattern(s).
   `-I` defines the name pattern that *must* be present in the stack traces,
