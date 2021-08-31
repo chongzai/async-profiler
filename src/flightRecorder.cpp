@@ -84,6 +84,7 @@ class MethodInfo {
     MethodInfo() : _key(0) {
     }
 
+    bool _mark;
     u32 _key;
     u32 _class;
     u32 _name;
@@ -106,9 +107,25 @@ class MethodInfo {
     }
 };
 
+class MethodMap : public std::map<jmethodID, MethodInfo> {
+  public:
+    MethodMap() {
+    }
+
+    ~MethodMap() {
+        jvmtiEnv* jvmti = VM::jvmti();
+        for (const_iterator it = begin(); it != end(); ++it) {
+            jvmtiLineNumberEntry* line_number_table = it->second._line_number_table;
+            if (line_number_table != NULL) {
+                jvmti->Deallocate((unsigned char*)line_number_table);
+            }
+        }
+    }
+};
+
 class Lookup {
   public:
-    std::map<jmethodID, MethodInfo> _method_map;
+    MethodMap* _method_map;
     Dictionary* _classes;
     Dictionary _packages;
     Dictionary _symbols;
@@ -183,27 +200,17 @@ class Lookup {
     }
 
   public:
-    Lookup() : _method_map(), _packages(), _symbols() {
-        _classes = Profiler::instance()->classMap();
-    }
-
-    ~Lookup() {
-        jvmtiEnv* jvmti = VM::jvmti();
-
-        for (std::map<jmethodID, MethodInfo>::const_iterator it = _method_map.begin(); it != _method_map.end(); ++it) {
-            jvmtiLineNumberEntry* line_number_table = it->second._line_number_table;
-            if (line_number_table != NULL) {
-                jvmti->Deallocate((unsigned char*)line_number_table);
-            }
-        }
+    Lookup(MethodMap* method_map, Dictionary* classes) :
+        _method_map(method_map), _classes(classes), _packages(), _symbols() {
     }
 
     MethodInfo* resolveMethod(ASGCT_CallFrame& frame) {
         jmethodID method = frame.method_id;
-        MethodInfo* mi = &_method_map[method];
+        MethodInfo* mi = &(*_method_map)[method];
+        mi->_mark = true;
 
         if (mi->_key == 0) {
-            mi->_key = _method_map.size();
+            mi->_key = _method_map->size();
 
             if (method == NULL) {
                 fillNativeMethodInfo(mi, "unknown");
@@ -371,6 +378,7 @@ class Recording {
     pthread_t _timer_thread;
     off_t _chunk_start;
     ThreadFilter _thread_set;
+    MethodMap _method_map;
 
     u64 _start_time;
     u64 _start_nanos;
@@ -477,7 +485,7 @@ class Recording {
     }
 
   public:
-    Recording(int fd, Arguments& args) : _fd(fd), _thread_set() {
+    Recording(int fd, Arguments& args) : _fd(fd), _thread_set(), _method_map() {
         _chunk_start = lseek(_fd, 0, SEEK_END);
         _start_time = OS::millis();
         _start_nanos = OS::nanotime();
@@ -907,7 +915,7 @@ class Recording {
 
         buf->putVar32(9);
 
-        Lookup lookup;
+        Lookup lookup(&_method_map, Profiler::instance()->classMap());
         writeFrameTypes(buf);
         writeThreadStates(buf);
         writeThreads(buf);
@@ -988,7 +996,7 @@ class Recording {
             buf->putVar32(trace->num_frames);
             for (int i = 0; i < trace->num_frames; i++) {
                 MethodInfo* mi = lookup->resolveMethod(trace->frames[i]);
-                buf->putVar64(mi->_key | _base_id);
+                buf->putVar32(mi->_key);
                 jint bci = trace->frames[i].bci;
                 if (bci >= 0) {
                     buf->putVar32(mi->getLineNumber(bci));
@@ -1005,19 +1013,29 @@ class Recording {
     }
 
     void writeMethods(Buffer* buf, Lookup* lookup) {
-        std::map<jmethodID, MethodInfo>& method_map = lookup->_method_map;
+        MethodMap* method_map = lookup->_method_map;
+
+        u32 marked_count = 0;
+        for (MethodMap::const_iterator it = method_map->begin(); it != method_map->end(); ++it) {
+            if (it->second._mark) {
+                marked_count++;
+            }
+        }
 
         buf->putVar32(T_METHOD);
-        buf->putVar32(method_map.size());
-        for (std::map<jmethodID, MethodInfo>::const_iterator it = method_map.begin(); it != method_map.end(); ++it) {
-            const MethodInfo& mi = it->second;
-            buf->putVar64(mi._key | _base_id);
-            buf->putVar32(mi._class);
-            buf->putVar64(mi._name | _base_id);
-            buf->putVar64(mi._sig | _base_id);
-            buf->putVar32(mi._modifiers);
-            buf->putVar32(0);  // hidden
-            flushIfNeeded(buf);
+        buf->putVar32(marked_count);
+        for (MethodMap::iterator it = method_map->begin(); it != method_map->end(); ++it) {
+            MethodInfo& mi = it->second;
+            if (mi._mark) {
+                mi._mark = false;
+                buf->putVar32(mi._key);
+                buf->putVar32(mi._class);
+                buf->putVar64(mi._name | _base_id);
+                buf->putVar64(mi._sig | _base_id);
+                buf->putVar32(mi._modifiers);
+                buf->putVar32(0);  // hidden
+                flushIfNeeded(buf);
+            }
         }
     }
 
